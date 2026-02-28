@@ -1,0 +1,89 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libopencv-dev python3 python3-pip imagemagick
+
+      - name: Build
+        run: |
+          mkdir -p build && cd build
+          cmake ..
+          make -j headless_runner
+
+      - name: Generate test image
+        run: |
+          python3 tools/generate_test_image.py test_ci.jpg
+
+      - name: Write config
+        run: |
+          cat > config_ci.yml <<'YAML'
+          src_top_left_x: 0.45
+          src_top_right_x: 0.55
+          src_top_y: 0.62
+          src_bottom_left_x: 0.05
+          src_bottom_right_x: 0.95
+          dst_left_x: 0.2
+          dst_right_x: 0.8
+          smoothing_alpha: 0.2
+          canny_low: 50
+          canny_high: 150
+          hough_threshold: 50
+          hough_min_line_len: 30
+          hough_max_line_gap: 10
+          YAML
+
+      - name: Run headless runner
+        id: run
+        run: |
+          ./build/headless_runner test_ci.jpg test_out_ci.jpg --config config_ci.yml --offset-file offset_ci.json --print-offset | tee run_out.txt
+          # capture offset line to file
+          grep -E "^offset=" run_out.txt || true
+
+      - name: Make thumbnail
+        run: |
+          # create a small thumbnail for PR comment embedding
+          convert test_out_ci.jpg -resize 600x300 thumb_ci.jpg || true
+
+      - name: Upload output image and offset
+        uses: actions/upload-artifact@v4
+        with:
+          name: lane-detection-output
+          path: |
+            test_out_ci.jpg
+            offset_ci.json
+            run_out.txt
+            thumb_ci.jpg
+
+      - name: Comment on PR with offset and thumbnail
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let offset = 'N/A';
+            try {
+              const out = fs.readFileSync('run_out.txt','utf8');
+              const m = out.match(/offset=([\-0-9\.NaN]+)/);
+              if (m) offset = m[1];
+            } catch(e) {}
+            const pr = context.payload.pull_request.number;
+            let body = `Lane detection CI ran. offset=${offset}\n\n`;
+            try {
+              const img = fs.readFileSync('thumb_ci.jpg');
+              const b64 = img.toString('base64');
+              body += `![output](data:image/jpeg;base64,${b64})\n\n`;
+            } catch(e) {
+              body += 'Thumbnail not available.\n\n';
+            }
+            body += 'Artifacts: lane-detection-output (see Actions artifacts)';
+            github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: pr, body});
