@@ -86,15 +86,41 @@ cv::Mat LaneDetector::getPerspectiveMat(int w, int h, bool forward) {
 }
 
 cv::Mat LaneDetector::perspectiveTransform(const cv::Mat &img, bool forward) {
-    cv::Mat M = getPerspectiveMat(img.cols, img.rows, forward);
+    if (cached_w_ != img.cols || cached_h_ != img.rows) ensureCache(img.cols, img.rows);
     cv::Mat out;
-    cv::warpPerspective(img, out, M, img.size(), cv::INTER_LINEAR);
+    if (forward) cv::warpPerspective(img, out, cached_M_forward_, img.size(), cv::INTER_LINEAR);
+    else cv::warpPerspective(img, out, cached_M_inverse_, img.size(), cv::INTER_LINEAR);
     return out;
+}
+
+void LaneDetector::ensureCache(int w, int h) {
+    cached_w_ = w; cached_h_ = h;
+    cached_M_forward_ = getPerspectiveMat(w, h, true);
+    cached_M_inverse_ = getPerspectiveMat(w, h, false);
+    // build ROI mask once per size (mask in bird-eye space)
+    cv::Mat mask = cv::Mat::zeros(h, w, CV_8UC1);
+    std::vector<cv::Point> pts;
+    pts.emplace_back(static_cast<int>(w * 0.1), h);
+    pts.emplace_back(static_cast<int>(w * 0.45), static_cast<int>(h * 0.6));
+    pts.emplace_back(static_cast<int>(w * 0.55), static_cast<int>(h * 0.6));
+    pts.emplace_back(static_cast<int>(w * 0.9), h);
+    std::vector<std::vector<cv::Point>> fillPts = {pts};
+    cv::fillPoly(mask, fillPts, cv::Scalar(255));
+    cached_roi_mask_ = mask;
 }
 
 // Constructors
 LaneDetector::LaneDetector(): cfg_(), smoothing_alpha_(cfg_.smoothing_alpha) {}
 LaneDetector::LaneDetector(const DetectorConfig &cfg): cfg_(cfg), smoothing_alpha_(cfg_.smoothing_alpha) {}
+
+// initialize Kalman filter matrices (state: [x, v], measurement: [x])
+static void initKalman(cv::KalmanFilter &kf) {
+    kf.transitionMatrix = (cv::Mat_<float>(2,2) << 1.0f, 1.0f, 0.0f, 1.0f);
+    kf.measurementMatrix = (cv::Mat_<float>(1,2) << 1.0f, 0.0f);
+    kf.processNoiseCov = cv::Mat::eye(2,2,CV_32F) * 1e-3f;
+    kf.measurementNoiseCov = cv::Mat::eye(1,1,CV_32F) * 1e-1f;
+    kf.errorCovPost = cv::Mat::eye(2,2,CV_32F);
+}
 
 bool LaneDetector::polyfitQuadratic(const std::vector<cv::Point> &pts, cv::Vec3d &coeffs) {
     if (pts.size() < 3) return false;
@@ -123,8 +149,8 @@ static void collectLinePoints(const std::vector<cv::Vec4i> &lines, std::vector<c
     for (const auto &l : lines) {
         double m = slope(l);
         if (fabs(m) < 0.3) continue;
-        // sample points along the segment
-        int steps = 10;
+        // sample points along the segment (reduced steps for perf)
+        int steps = 6;
         for (int i=0;i<=steps;i++){
             double t = i/(double)steps;
             int x = static_cast<int>(l[0] + t*(l[2]-l[0]));
@@ -317,10 +343,11 @@ double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
             // fall back to pixel_lane_width from orig points
         }
 
-        // Debug logging: print intermediate values to help diagnose why pixel->meter fails
-        std::cerr << "DEBUG: leftPts=" << leftPts.size() << " rightPts=" << rightPts.size()
-              << " left_x=" << left_x << " right_x=" << right_x << " pixel_lane_width=" << pixel_lane_width
-              << " bev_left_x=" << bev_left_x << " bev_right_x=" << bev_right_x << " has_prev_left=" << has_prev_left_ << " has_prev_right=" << has_prev_right_ << "\n";
+        if (cfg_.verbose) {
+            std::cerr << "DEBUG: leftPts=" << leftPts.size() << " rightPts=" << rightPts.size()
+                      << " left_x=" << left_x << " right_x=" << right_x << " pixel_lane_width=" << pixel_lane_width
+                      << " bev_left_x=" << bev_left_x << " bev_right_x=" << bev_right_x << " has_prev_left=" << has_prev_left_ << " has_prev_right=" << has_prev_right_ << "\n";
+        }
         if (cfg_.pixels_per_meter > 0.0) {
             pixel_to_meter = cfg_.pixels_per_meter;
         } else if (cfg_.lane_width_m > 0.0 && pixel_lane_width > 0) {
@@ -330,8 +357,10 @@ double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
             double grad_pxpm = estimatePxPerMFromGradient(frame, left_x, right_x, cfg_.lane_width_m);
             if (grad_pxpm > 0.0) pixel_to_meter = grad_pxpm;
         }
-        std::cerr << "DEBUG: pixel_to_meter=" << pixel_to_meter << " cfg.pixels_per_meter=" << cfg_.pixels_per_meter
-                  << " cfg.lane_width_m=" << cfg_.lane_width_m << "\n";
+        if (cfg_.verbose) {
+            std::cerr << "DEBUG: pixel_to_meter=" << pixel_to_meter << " cfg.pixels_per_meter=" << cfg_.pixels_per_meter
+                      << " cfg.lane_width_m=" << cfg_.lane_width_m << "\n";
+        }
         if (pixel_to_meter > 0.0) {
             lateral_offset_m = lateral_offset / pixel_to_meter;
             char buf2[128];
@@ -355,7 +384,26 @@ double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
     double alpha = 0.7;
     cv::addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame);
 
+    // Apply Kalman smoothing to lateral offset (pixels) if available
+    if (std::isfinite(lateral_offset)) {
+        if (!kalman_initialized_) {
+            initKalman(kf_);
+            kf_.statePost.at<float>(0) = static_cast<float>(lateral_offset);
+            kf_.statePost.at<float>(1) = 0.0f;
+            kalman_initialized_ = true;
+            last_smoothed_offset_ = lateral_offset;
+        } else {
+            cv::Mat prediction = kf_.predict();
+            cv::Mat measurement(1,1,CV_32F);
+            measurement.at<float>(0) = static_cast<float>(lateral_offset);
+            cv::Mat estimated = kf_.correct(measurement);
+            last_smoothed_offset_ = static_cast<double>(estimated.at<float>(0));
+        }
+    }
+
     if (out_m) *out_m = lateral_offset_m;
+    // return smoothed offset in pixels when available
+    if (std::isfinite(last_smoothed_offset_)) return last_smoothed_offset_;
     return lateral_offset;
 }
 

@@ -25,6 +25,13 @@ public:
         // real-world scaling
         double lane_width_m = 0.0; // expected lane width in meters (optional)
         double pixels_per_meter = 0.0; // optional override, px/m
+            // optional camera calibration (if provided, frames can be undistorted)
+            cv::Mat camera_matrix;
+            cv::Mat dist_coeffs;
+            bool undistort = false;
+            // performance / debug
+            bool verbose = false;
+            int process_scale = 1; // 1 = full size, 2 = half size, etc.
     };
 
     LaneDetector();
@@ -62,6 +69,14 @@ private:
     double smoothing_alpha_ = 0.2; // exponential smoothing factor
     DetectorConfig cfg_;
     cv::Mat getPerspectiveMat(int w, int h, bool forward);
+    // Cache for perspective matrices and ROI mask to avoid recomputing each frame
+    void ensureCache(int w, int h);
+    cv::Mat cached_M_forward_, cached_M_inverse_, cached_roi_mask_;
+    int cached_w_ = 0, cached_h_ = 0;
+        // Simple Kalman filter to smooth lateral offset across frames
+        cv::KalmanFilter kf_{2,1,0};
+        bool kalman_initialized_ = false;
+        double last_smoothed_offset_ = std::numeric_limits<double>::quiet_NaN();
     // Metadata from last detection (updated by detectAndDraw)
     int last_lane_pixel_width = 0;            // measured lane pixel width at bottom
     double last_pixels_per_meter_used = 0.0;  // px per meter used for conversion (if any)

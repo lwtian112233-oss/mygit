@@ -1,0 +1,14 @@
+%YAML:1.0
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [800.0, 0.0, 640.0, 0.0, 800.0, 360.0, 0.0, 0.0, 1.0]
+dist_coeffs: [0.1, -0.05, 0.001, 0.0005, 0.0]
+lane_width_m: 3.7
+smoothing_alpha: 0.2
+canny_low: 50
+canny_high: 150
+hough_threshold: 50
+hough_min_line_len: 30
+hough_max_line_gap: 10

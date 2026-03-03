@@ -87,6 +87,24 @@ int main(int argc, char **argv) {
     if (!std::isnan(tmp_smoothing_alpha)) cfg.smoothing_alpha = tmp_smoothing_alpha;
     if (cli_lane_width > 0.0) cfg.lane_width_m = cli_lane_width;
     if (cli_pixels_per_meter > 0.0) cfg.pixels_per_meter = cli_pixels_per_meter;
+    // If config file provided, try to read camera calibration and enable undistort
+    if (!config_path.empty()) {
+        cv::FileStorage fs2(config_path, cv::FileStorage::READ);
+        if (fs2.isOpened()) {
+            cv::Mat cam, dist;
+            fs2["camera_matrix"] >> cam;
+            fs2["dist_coeffs"] >> dist;
+            if (!cam.empty()) { cfg.camera_matrix = cam; cfg.dist_coeffs = dist; cfg.undistort = true; }
+            fs2.release();
+        }
+    }
+    // If requested, undistort the single input image before detection
+    if (cfg.undistort && !cfg.camera_matrix.empty()) {
+        cv::Mat und;
+        cv::undistort(img, und, cfg.camera_matrix, cfg.dist_coeffs);
+        img = und;
+    }
+
     LaneDetector detector(cfg);
     double offset_m = std::numeric_limits<double>::quiet_NaN();
     double offset = detector.detectAndDraw(img, &offset_m);

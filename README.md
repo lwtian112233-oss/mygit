@@ -116,3 +116,26 @@ mkdir -p build && cd build && cmake .. && make -j headless_runner
 
 - 相机标定（去畸变）和更精细的透视区域选择。
 - 将拟合结果从 bird's-eye 空间映射回原始图像并对多帧间进行更稳健的跟踪（例如卡尔曼滤波或滑动窗口检测）。
+
+**示例：相机标定与配置文件**
+
+你可以把相机内参与检测参数放入一个 YAML 文件，并通过 `--config` 传入 `headless_runner` 或主程序。项目中包含示例文件 `example_calib.yml`，格式为 OpenCV `FileStorage` 可读取的形式，例如：
+
+```
+camera_matrix: !!opencv-matrix
+	rows: 3
+	cols: 3
+	dt: d
+	data: [800.0, 0.0, 640.0, 0.0, 800.0, 360.0, 0.0, 0.0, 1.0]
+dist_coeffs: [0.1, -0.05, 0.001, 0.0005, 0.0]
+lane_width_m: 3.7
+```
+
+`headless_runner` 会在检测前尝试读取 `camera_matrix` / `dist_coeffs` 并对输入图像做 `cv::undistort`（若提供）。示例运行：
+
+```bash
+./build/headless_runner ../test.jpg ../test_out.jpg --config ../example_calib.yml --offset-file ../offset.json --print-offset
+```
+
+在没有标定数据时，仍会使用默认 pipeline；建议在真实相机上使用相机标定以获得更准确的 px→m 换算与车道拟合。
+
