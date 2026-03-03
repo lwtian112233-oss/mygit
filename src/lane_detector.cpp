@@ -1,6 +1,7 @@
 #include "lane_detector.h"
 #include <limits>
 #include <iostream>
+#include <algorithm>
 
 static double slope(const cv::Vec4i &l) {
     double dx = l[2] - l[0];
@@ -26,7 +27,7 @@ cv::Mat LaneDetector::regionOfInterest(const cv::Mat &img) {
     return out;
 }
 
-std::vector<cv::Vec4i> LaneDetector::filterAndAverageLines(const std::vector<cv::Vec4i> &lines, int imgWidth) {
+std::vector<cv::Vec4i> LaneDetector::filterAndAverageLines(const std::vector<cv::Vec4i> &lines, int imgWidth, int imgHeight) {
     // Separate into left and right by slope sign and x position
     std::vector<std::pair<double, double>> left; // slope, intercept
     std::vector<std::pair<double, double>> right;
@@ -46,8 +47,8 @@ std::vector<cv::Vec4i> LaneDetector::filterAndAverageLines(const std::vector<cv:
         double m_avg = 0, b_avg = 0;
         for (auto &p : arr) { m_avg += p.first; b_avg += p.second; }
         m_avg /= arr.size(); b_avg /= arr.size();
-        int y1 = imgWidth * 0.6; // approximate top y of lane
-        int y2 = imgWidth;       // bottom y
+        int y1 = static_cast<int>(imgHeight * 0.6); // approximate top y of lane
+        int y2 = imgHeight;       // bottom y
         // convert y to x: x = (y - b) / m
         int x1 = static_cast<int>((y1 - b_avg) / m_avg);
         int x2 = static_cast<int>((y2 - b_avg) / m_avg);
@@ -134,6 +135,53 @@ static void collectLinePoints(const std::vector<cv::Vec4i> &lines, std::vector<c
     }
 }
 
+// Estimate pixels-per-meter by finding strong vertical gradients near expected
+// left/right lane edge positions at the bottom region of the image. Returns
+// px_per_m (>0) on success or 0 on failure.
+static double estimatePxPerMFromGradient(const cv::Mat &frame, int left_x, int right_x, double lane_width_m) {
+    if (lane_width_m <= 0.0) return 0.0;
+    cv::Mat gray;
+    if (frame.channels() == 3) cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    else gray = frame;
+    int h = gray.rows, w = gray.cols;
+    int y0 = std::max(0, static_cast<int>(h * 0.6));
+    int y1 = h - 1;
+    int x0 = std::max(0, left_x - 120);
+    int x1 = std::min(w - 1, right_x + 120);
+    if (x1 <= x0) return 0.0;
+
+    cv::Mat gx;
+    cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
+
+    std::vector<float> profile(x1 - x0 + 1, 0.0f);
+    for (int y = y0; y <= y1; ++y) {
+        const float *row = gx.ptr<float>(y);
+        for (int x = x0; x <= x1; ++x) profile[x - x0] += std::abs(row[x]);
+    }
+    // smooth profile with simple box filter
+    int k = 7;
+    std::vector<float> smooth(profile.size(), 0.0f);
+    for (size_t i = 0; i < profile.size(); ++i) {
+        int a = std::max<int>(0, i - k/2);
+        int b = std::min<int>(profile.size()-1, i + k/2);
+        float s = 0; int cnt = 0;
+        for (int j=a;j<=b;++j){ s+=profile[j]; cnt++; }
+        smooth[i] = s / std::max(1, cnt);
+    }
+    int mid = (left_x + right_x) / 2 - x0;
+    if (mid <= 0 || mid >= static_cast<int>(smooth.size())) return 0.0;
+    // find peak in left and right halves
+    auto left_it = std::max_element(smooth.begin(), smooth.begin() + std::max(1, mid));
+    auto right_it = std::max_element(smooth.begin() + std::min((int)smooth.size()-1, mid+1), smooth.end());
+    int left_peak = static_cast<int>(std::distance(smooth.begin(), left_it)) + x0;
+    int right_peak = static_cast<int>(std::distance(smooth.begin(), right_it)) + x0;
+    if (right_peak <= left_peak) return 0.0;
+    int pixel_width = right_peak - left_peak;
+    if (pixel_width <= 0) return 0.0;
+    double px_per_m = static_cast<double>(pixel_width) / lane_width_m;
+    return px_per_m;
+}
+
 double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
     // 1. Preprocess
     cv::Mat gray, blur, edges;
@@ -161,10 +209,12 @@ double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
 
     // 6. Temporal smoothing (single-image demo uses previous values if available)
     if (leftOk) {
-        prev_left_ = smoothing_alpha_ * leftCoef + (1.0 - smoothing_alpha_) * prev_left_;
+        if (has_prev_left_) prev_left_ = smoothing_alpha_ * leftCoef + (1.0 - smoothing_alpha_) * prev_left_;
+        else { prev_left_ = leftCoef; has_prev_left_ = true; }
     }
     if (rightOk) {
-        prev_right_ = smoothing_alpha_ * rightCoef + (1.0 - smoothing_alpha_) * prev_right_;
+        if (has_prev_right_) prev_right_ = smoothing_alpha_ * rightCoef + (1.0 - smoothing_alpha_) * prev_right_;
+        else { prev_right_ = rightCoef; has_prev_right_ = true; }
     }
 
     // 7. Draw fitted lanes back on original image (inverse perspective)
@@ -232,8 +282,27 @@ double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
         int pixel_lane_width = std::abs(right_x - left_x);
         // compute bev bottom x positions from quadratic coefficients
         double bev_y = static_cast<double>(h);
-        double bev_left_x = prev_left_[0]*bev_y*bev_y + prev_left_[1]*bev_y + prev_left_[2];
-        double bev_right_x = prev_right_[0]*bev_y*bev_y + prev_right_[1]*bev_y + prev_right_[2];
+        double bev_left_x = std::numeric_limits<double>::quiet_NaN();
+        double bev_right_x = std::numeric_limits<double>::quiet_NaN();
+        auto coef_valid = [](const cv::Vec3d &c)->bool {
+            for (int i=0;i<3;++i) {
+                if (!std::isfinite(c[i])) return false;
+            }
+            // avoid degenerate all-zero
+            if (std::abs(c[0]) < 1e-12 && std::abs(c[1]) < 1e-8 && std::abs(c[2]) < 1e-3) return false;
+            return true;
+        };
+        if (has_prev_left_ && coef_valid(prev_left_)) bev_left_x = prev_left_[0]*bev_y*bev_y + prev_left_[1]*bev_y + prev_left_[2];
+        if (has_prev_right_ && coef_valid(prev_right_)) bev_right_x = prev_right_[0]*bev_y*bev_y + prev_right_[1]*bev_y + prev_right_[2];
+        // Fallback: if bev coefficients invalid, try linear averaged Hough lines in bev space
+        if (!std::isfinite(bev_left_x) || !std::isfinite(bev_right_x)) {
+            auto avg_lines = filterAndAverageLines(lines, frame.cols, frame.rows);
+            if (!avg_lines.empty()) {
+                // avg_lines: first=left, second=right (if available)
+                if (avg_lines.size() >= 1) bev_left_x = static_cast<double>(avg_lines[0][2]);
+                if (avg_lines.size() >= 2) bev_right_x = static_cast<double>(avg_lines[1][2]);
+            }
+        }
         std::vector<cv::Point2f> bev_bottom_pts = { cv::Point2f(static_cast<float>(bev_left_x),(float)bev_y), cv::Point2f(static_cast<float>(bev_right_x),(float)bev_y) };
         std::vector<cv::Point2f> mapped_bottom_pts;
         try {
@@ -248,11 +317,21 @@ double LaneDetector::detectAndDraw(cv::Mat &frame, double *out_m) {
             // fall back to pixel_lane_width from orig points
         }
 
+        // Debug logging: print intermediate values to help diagnose why pixel->meter fails
+        std::cerr << "DEBUG: leftPts=" << leftPts.size() << " rightPts=" << rightPts.size()
+              << " left_x=" << left_x << " right_x=" << right_x << " pixel_lane_width=" << pixel_lane_width
+              << " bev_left_x=" << bev_left_x << " bev_right_x=" << bev_right_x << " has_prev_left=" << has_prev_left_ << " has_prev_right=" << has_prev_right_ << "\n";
         if (cfg_.pixels_per_meter > 0.0) {
             pixel_to_meter = cfg_.pixels_per_meter;
         } else if (cfg_.lane_width_m > 0.0 && pixel_lane_width > 0) {
             pixel_to_meter = static_cast<double>(pixel_lane_width) / cfg_.lane_width_m; // px per meter
+        } else if (cfg_.lane_width_m > 0.0) {
+            // try gradient-based estimate around bottom of image
+            double grad_pxpm = estimatePxPerMFromGradient(frame, left_x, right_x, cfg_.lane_width_m);
+            if (grad_pxpm > 0.0) pixel_to_meter = grad_pxpm;
         }
+        std::cerr << "DEBUG: pixel_to_meter=" << pixel_to_meter << " cfg.pixels_per_meter=" << cfg_.pixels_per_meter
+                  << " cfg.lane_width_m=" << cfg_.lane_width_m << "\n";
         if (pixel_to_meter > 0.0) {
             lateral_offset_m = lateral_offset / pixel_to_meter;
             char buf2[128];

@@ -47,7 +47,7 @@ public:
 private:
     cv::Mat regionOfInterest(const cv::Mat &img);
     void drawLines(cv::Mat &img, const std::vector<cv::Vec4i> &lines);
-    std::vector<cv::Vec4i> filterAndAverageLines(const std::vector<cv::Vec4i> &lines, int imgWidth);
+    std::vector<cv::Vec4i> filterAndAverageLines(const std::vector<cv::Vec4i> &lines, int imgWidth, int imgHeight);
 
     // New helpers for improved pipeline
     cv::Mat perspectiveTransform(const cv::Mat &img, bool forward);
@@ -57,6 +57,8 @@ private:
     // Temporal smoothing: keep previous coefficients for left/right lanes
     cv::Vec3d prev_left_{0,0,0};
     cv::Vec3d prev_right_{0,0,0};
+    bool has_prev_left_ = false;
+    bool has_prev_right_ = false;
     double smoothing_alpha_ = 0.2; // exponential smoothing factor
     DetectorConfig cfg_;
     cv::Mat getPerspectiveMat(int w, int h, bool forward);

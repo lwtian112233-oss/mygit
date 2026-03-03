@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(OpenCV REQUIRED)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR}/src)
 
 add_executable(lane_detector
   src/main.cpp
@@ -21,3 +22,10 @@ add_executable(headless_runner
 )
 
 target_link_libraries(headless_runner ${OpenCV_LIBS})
+
+# Simple unit test to validate px->m estimation on synthetic image
+add_executable(pxm_test
+  tests/pxm_test.cpp
+  src/lane_detector.cpp
+)
+target_link_libraries(pxm_test ${OpenCV_LIBS})
